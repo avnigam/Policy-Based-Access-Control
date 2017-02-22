@@ -1,0 +1,166 @@
+import random
+from configparser import ConfigParser
+import time
+import csv
+
+
+# This is the Database Process Class.
+# There will be only a single DB class which spans only single process.
+# All other processes will talk to single DB Process
+
+class Database(process):
+    # This function is called when the database is being setup.
+    def setup(coordinator_dict, config_file):
+        output("Setting up Database...")
+        self.db_subject_file = ''
+        self.db_resource_file = ''
+        self.coordinator_dict = coordinator_dict
+        self.list_subject = {a}
+        self.list_resource = {}
+        self.min_delay = 0
+        self.max_delay = 0
+        self.config_file = config_file
+
+    def data_init(db_subject_file, db_resource_file):
+        timestamp = int(time.time())
+        subject = {}
+        resource = {}
+        with open(db_subject_file) as f:
+            lines = f.readlines()
+            for line in lines:
+                row = line.rstrip().split(',')
+                subject.update({row[0]: ([(row[1], timestamp)], [(row[2], timestamp)], [(row[3], timestamp)])})
+
+        with open(db_resource_file) as f:
+            lines = f.readlines()
+            for line in lines:
+                row = line.rstrip().split(',')
+                resource.update({row[0]: ([(row[1], timestamp)], [(row[2], timestamp)], [(row[3], timestamp)])})
+
+        return subject, resource
+
+    # This function is called when the database is started.
+    # It gets the metadata from configuration file and then loads the data to db from xml.
+    def run():
+        output("Database Process coming up...")
+        get_configuration()
+        load_data_xml()
+        await(received(('terminate',)))
+        output("DB Subject Dump: " + str(list_subject))
+        output("DB Resource Dump: " + str(list_resource))
+        output("Terminated DB Process...")
+
+    # This function takes care of reading subject data from the database based on subject id
+    def read_subject(s_id, timestamp):
+        output("Reading data from Database for Subject Id: " + str(s_id))
+        row = list_subject[s_id]
+        if row is None:
+            list_subject.update({s_id: ([("0", timestamp)], [(0, timestamp)], [(0, timestamp)])})
+
+        (s_id, cust_type, status, history) = (s_id, row[1][0], row[2][0], row[3][0])
+        return (s_id, cust_type, status, history)
+
+    # This function takes care of reading resource data from the database based on resource id
+    def read_resource(r_id, timestamp):
+        output("Reading data from Database for Resource Id: " + str(r_id))
+        row = list_resource[r_id]
+        if row is None:
+            list_resource.update({r_id: ([(0, timestamp)], [(0, timestamp)], [(0, timestamp)])})
+
+        (r_id, balance, no_of_trans, last_trans) = (r_id, row[1][0], row[2][0], row[3][0])
+        return (r_id, balance, no_of_trans, last_trans)
+
+    # This function takes care of writing subject data into database based on subject id
+    def write_subject(record, timestamp):
+        output("Writing data into Database for Subject Record: " + str(record))
+        (s_id, cust_type, status, history) = record
+
+        # timestamp = int(time.time())
+        current_record = list_subject[s_id]
+
+        output("Update DB")
+        if current_record is None:
+            output("No previous record")
+            list_subject.update({s_id: ([("0", timestamp)], [(0, timestamp)], [(0, timestamp)])})
+        else:
+            output("Updating Current Record")
+            if cust_type:
+                current_record[0].append((cust_type, timestamp))
+                sorted(current_record[0], key=lambda tup: tup[1], reverse=True)
+            if status:
+                current_record[1].append((status, timestamp))
+                sorted(current_record[1], key=lambda tup: tup[1], reverse=True)
+            if history:
+                current_record[2].append((history, timestamp))
+                sorted(current_record[2], key=lambda tup: tup[1], reverse=True)
+
+            list_subject.update({s_id: (current_record[0], current_record[1], current_record[2])})
+
+    # This function takes care of writing resource data into database based on subject id
+    def write_resource(record, timestamp):
+        output("Writing data into Database for Resource Record: " + str(record))
+        (r_id, balance, no_of_trans, last_trans) = record
+
+        # timestamp = int(time.time())
+        current_record = list_resource[r_id]
+
+        if current_record is None:
+            list_resource.update({r_id: ([(0, timestamp)], [(0, timestamp)], [(0, timestamp)])})
+        else:
+            if balance:
+                current_record[0].append((balance, timestamp))
+                current_record[0] = sorted(current_record[0], key=lambda tup: tup[1], reverse=True)
+            if no_of_trans:
+                current_record[1].append((no_of_trans, timestamp))
+                current_record[1] = sorted(current_record[1], key=lambda tup: tup[1], reverse=True)
+            if last_trans:
+                current_record[2].append((last_trans, timestamp))
+                current_record[2] = sorted(current_record[2], key=lambda tup: tup[1], reverse=True)
+
+            list_resource.update({r_id: (current_record[0], current_record[1], current_record[2])})
+
+    # This function receives database read request from the Coordinator
+    # Based on type of data required, it is returned to the Coordinator
+    def receive(msg=('read', cid, type, id), from_=Coordinator):
+        output("Receiving database read request from Coordinator: " + str(cid))
+        request_timestamp = int(time.time())
+        if type == 'subject':
+            data = read_subject(id, time.time())
+        elif type == 'resource':
+            data = read_resource(id, time.time())
+
+        if type == 'dump':
+            send(('dump_sent', (list_subject, list_resource)), to=coordinator_dict[cid])
+        else:
+            delay = random.randint(min_delay, max_delay)
+            await(int(time.time()) - request_timestamp > delay)
+            send(('read_done', data), to=coordinator_dict[cid])
+
+    # This function receives database write request from the Coordinator
+    def receive(msg=('write', cid, type, tuple), from_=Coordinator):
+        output("Receiving database write request from Coordinator: " + str(cid))
+        output("Coordinator Dict: " + str(coordinator_dict))
+        request_timestamp = int(time.time())
+        if type == 'subject':
+            write_subject(tuple, time.time())
+        else:
+            write_resource(tuple, time.time())
+
+        send(('written',), to=coordinator_dict[cid])
+
+    # Loading configuration from the properties file
+    def get_configuration():
+        output("Reading Configuration from properties file")
+        config = ConfigParser()
+        config.read(config_file)
+        db_subject_file = config.get('DatabaseSection', 'db_subject_file')
+        db_resource_file = config.get('DatabaseSection', 'db_resource_file')
+        min_delay = int(config.get('DatabaseSection', 'min_db_latency'))
+        max_delay = int(config.get('DatabaseSection', 'max_db_latency'))
+
+    # Loading the initial data for DB load
+    def load_data_xml():
+        output("Initial Load to DB")
+        (list_subject, list_resource) = data_init(db_subject_file, db_resource_file)
+        output("Database Data Subject Table : " + str(list_subject))
+        output("Database Data Resource Table : " + str(list_resource))

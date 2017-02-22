@@ -1,0 +1,616 @@
+*****************************************************************************************
+
+# Asynchronous Systems - CSE 535
+# Project: Distributed History-Based Access Control Policy Evaluation
+# Phase: 3
+# Authors
+# 1. Aviral Nigam
+# 2. Swarnima Shrivastava
+# Type: Pseudocode
+
+*****************************************************************************************
+
+-----------------------------------------------------------------------------------------
+SETUP OVERVIEW
+-----------------------------------------------------------------------------------------
+**************
+Generic 
+**************
+# In all of the pseudocode, object should be the subject or resource of the request.
+# Generic functions which are non-policy specific, are documented at bottom of the pseudocode.
+# All receive_* type of functions are event listeners which gets invoked on the initialization of the process.
+# These event listeners wait for messages once invocation is successful.
+
+**************
+Client
+**************
+# Each client will be generating the request to be fulfilled by the system explained below.
+# Each client will have access to the policy for static policy analysis.
+# Each client will have store the results received from request to better predict the object to be updated. Since client will not have access to #--other client's information and hence every prediction made will be on partial knowledge in a non-static environment.
+
+**************
+Coordinator
+**************
+# Each Coordinator is responsible for one or more Subject or Resource objects. But each object is assigned to only one Coordinator.
+# Each Coordinator has local workers who are assigned jobs in round robin fashion to perform policy evaluations more efficiently.
+# Each Coordinator node has access to a local database instance which is in sync with the database instance on other coordinator instances.
+# Each Coordinator stores a Database Cache which stores latest updates to compensate for replication of the database and also decrease the time to #--read the data if actual database is query is required.
+# Each Coordinator stores map for version data structure of the object specific attribute values given object and it's attributes. 
+# The version data is pushed into the map in desc write timestamp manner, extraction and removal for version data can be done from anywhere in the #--map but as per the pseudocode, it will preferably be done in order to leverage the sorted timestamp.
+# The version data structure will contain two queues; one for pending read request and one for pending write request.
+# This sequencing of objects to be evaluated will make significance only in case of write request.
+# For read-only request, it does not make much of a difference and hence static sequencing is used for read-only request.
+
+**************
+Worker
+**************
+# Each worker is an independent process running on the same node as the coordinator.
+# Each worker has access to policy, local database and local database cache of the coordinator.
+# These informations will make policy evaluation faster and more accurate.  
+
+**************
+Database
+**************
+# Each Database instance stores the attributes and their values for Subjects and Resources.
+# Each local Database is an instance of distributed and fully-replicated database.
+# The Database used is a multi-version protocol based, which stores a sequence of version associated with each data item.
+# Each version v of data item will contain the value of data item for the version v, time of the transaction which created the version.
+# Writes performed by a query are given a write-timestamp equal to the query's timestamp
+# Reads performed by a query use the most recent values with timestamp less than the query's timestamp. 
+# Read timestamps are not stored in the database.
+
+**************
+Limitations
+**************
+# This pseudocode is prone to deadlock in some cases. One such case is when two simultaneous writes are having cross linked read and write attributes.
+# This pseudocode prevents starvation of write request due to excessive read requests but does not prevent starvation of write request due to stream #--of write requests.
+# Possible solution can be to delay all conflicting requests while write is happening so as to prevent starvation of writes due to stream of write #--requests. This solution has not been implemented in the pseudocode.
+
+-----------------------------------------------------------------------------------------
+
+/* Master pseudocode starts here */
+
+##############################################################################################################
+# This is the start phase of the application and all the components involved will be started.
+# Master process starts Coordinator, Database and Worker processes.
+# Starting of Client by the master process is application specific but we are considering Master to start that as well.
+##############################################################################################################
+Process Master:
+	# On started by User/Application
+	start Client processes
+	start Coordinator processes
+	start specific number of Worker processes per coordinator
+	start local Database process per coordinator
+
+/* Master pseudocode ends here */
+
+
+/* Client pseudocode starts here */
+
+##############################################################################################################
+# Client is the starting point for request sending mechanism.
+# Client will classify if the request is read or write operation based on:
+# 1. Available information about the request.
+# 2. Simple static analysis of the policy.
+# 3. Information received with request as part of evaluation result.
+# information_map: map where <key, value> = <(subject_id, resource_id, action), <updatedObj>>
+# updatedObj is a subset of the set {Subject, Resource}.
+##############################################################################################################
+
+Process Client:
+
+	# On the start of client, information_map is initialized which is used for determining object to be updated.
+	# The updatedObj will be empty for read request and subset of {Subject, Resource} for write request.
+	# The pseudocode for the static policy analysis is out of scope of this document. 
+	Initializes information_map using static policy analysis and data available.
+
+	# Based on static policy analysis and data available to the Client.
+	# Figure out if the request to be sent is of type Read or Write.
+	def requestType(request):
+		if information_map(request.subject_id, request.resource_id, action) == {Empty Set}:
+			return 'Read'
+		else:
+			return 'Write'
+
+	# For each request to be sent for evaluation.
+	def send_request():
+		# For every request generate a unique id.
+		# No pseudocode for getuuid().
+		request.id = getuuid();
+
+		# For every request, the basic information sent in the request.
+		request = (subject_id, resource_id, action)
+
+		# For every request figure out the request type to be Read/Write.
+		request_type = requestType(request)
+
+		# Actions based on if it is a read or write request.
+		if request_type == 'Read':
+
+			# For read request we choose Subject first in the pseudo code but the order is immaterial in actual execution. 
+			object = obj(request, 1)
+
+			# For read request, we send might update object in the request as None.
+			request.might_update_obj = None
+
+		elif request_type == 'Write':
+
+			# Figure out whether Subject or Resource object needs to be updated.
+			# Pseudocode for mightWriteObj is specific to policy semantics and hence hasn't been mentioned in this pseudocode.
+			i = mightWriteObj(request)
+
+			# For write request, we send might update object evaluated above in the request.
+			request.might_update_obj = obj(request, i)
+
+			# We choose the object for which write might not happen, to receive the message from client.
+			# This is done in order to avoid the non-local message from worker to coordinator responsible for object data commit. 
+			if i == 1:
+				object = obj(request, 2)
+			elif i == 2:
+				object = obj(request, 1)
+
+		# Piggyback client id on the request.
+		# self.id is the id of the client process on which this execution happens.
+		request.client_id = self.id;
+
+		# Send request message to the coordinator responsible for object evaluated above
+		send non-local message("request", request) to coordinator(object)
+
+	# For each response received for the request.
+	# Client will receive response from Worker or Coordinator depending on Read/Write request.
+	def receive_response(message, request):
+
+		# Extract decision from the request.
+		decision = request.decision
+
+		# Apply update to information_map for write requests.
+		if request.updatedObj > 0:
+			# Update information_map with the updated object information received in the message.
+			information_map.update(request.subject_id, request.resource_id, request.action) = request.updatedObj
+
+/* Client pseudocode ends here */
+
+
+/* Coordinator pseudocode starts here */
+
+##############################################################################################################
+# dedicated_worker_list: list of workers assigned to the coordinator, residing locally on the coordinator.
+# now(): returns the current date-time.
+# mightWriteObj(request): It is upper bound on the set of objects updated by request mightWriteObj(request) subset {request.subject, request.resource}.
+# defReadAttr(object, request): It is a set of attributes of object definitely read by request.
+# mightReadAttr(object, request): Is an upper bound on the set of attributes of object that might be read by request and are not definitely read by #--request (i.e., are not in defReadAttr(object, request)).
+# cachedUpates(object, request): Is a set of cached updates of attributes of object that are in defReadAttr(object, request) union #--mightReadAttr(object, request).
+# mightWriteAttr(object, request): Is an upper bound on the set of attributes of object that might be updated by request.
+# defReadAttr and mightReadAttr are mutually exclusive sets.
+# pendingMightRead: version based list of attributes for an object that might be read during request evaluation and removed from pendingMightRead #--list once the request evaluation is complete.
+# pendingMightWrite: version based list of attributes for an object that might be written during request evaluation and removed from #--pendingMightWrite list once the request evaluation is complete.
+# cacheDB: cache to store the recent updates made for the database so that replication does not harm correct policy evaluation.
+# Since the pseudocode for mightWriteObj, defReadAttr and mightReadAttr functions will be specific to policy semantics, hence we haven't detailed it #--here in this pseudocode.
+##############################################################################################################
+
+Process Coordinator:
+
+	# On initialization, load the data from the database into the database cache.
+	# Since the database is local to the coordinator, it will be a local message to database.
+	# The cache is updated with the subject/resource data for which this coordinator is responsible.
+	# The initial dump will allow cache to be in consistent form with Database and hence further updates can be properly done.
+	Initialize cacheDB by querying the database.
+
+	# data_versions is the desc timestamp sorted list of version created during request evaluations used for getting latestVersionBefore.
+	# each version is structure which stores object, attribute, attribute_value, read_timestamp, write_timestamp
+	# each version also stores pendingMightRead and pendingMightWrite data structure mentioned above.
+	Initialize version list data_versions
+    
+    # Coordinator determines worker to evaluate the request in a round-robin fashion.
+	def determine_worker():
+		return dedicated_worker_list.round-robin()
+
+
+	# On receipt of request message from Client.
+	def receive_message_from_client(message, request):
+
+		# Wait for writes arrived before the current read request to be completed to avoid starvation
+		# Below conditions should satisfy.
+		# 1. Wait until pendingMightWrite list is empty i.e., all pending possibly conflicting request are complete.
+		await (forall <attribute, value> in mightReadAttr union defReadAttr:
+				latestVersionBefore(object, attribute, request.timestamp).pendingMightWrite == [])
+
+		# On receiving request as coordinator(obj(request, 1))
+		object = obj(request, 1)
+
+		# Get the current timestamp from function now().
+		timestamp = now()
+
+		# Piggyback timestamp on to the request.
+		request.timestamp = timestamp 
+
+		# Check if request contains might_update_obj.
+		# If the value of might_update_obj in the request is None, then it is 'Read' request else 'Write' request.
+		if request.might_update_obj == None:
+			# Evaluating read request.
+
+			# Updating the read timestamp of definetely read attributes to current timestamp.
+			for attribute in defReadAttr(object, request):
+				latestVersionBefore(object, attribute, request.timestamp).read_timestamp = request.timestamp
+
+			# Add might read attributes to the pendingMightRead list with request id and current timestamp.
+			for attribute in mightReadAttr(object, request):
+				latestVersionBefore(object, attribute, request.timestamp).pendingMightRead.add(request.id)
+
+		else:
+			# Evaluating update request.
+
+			# Add definetely read and might read attributes to the pendingMightRead list with request id and current timestamp.
+			for attribute in defReadAttr(object, request) union mightReadAttr(object, request):
+				latestVersionBefore(object, attribute, request.timestamp).pendingMightRead.add(request.id)
+
+		# Piggyback cached updates on the request.
+		request.cachedUpdates[1] = cachedUpdates(cacheDB, object, request, request.timestamp)
+
+		# Check if the coordinator for obj(request, 2) is same as current coordinator.
+		# If yes, then call function within coordinator which perform further steps.
+		# If no, send a non-local message to coordinator responsible for further processing.
+		if (coordinator(obj(request, )) == coordinator(obj(request, 1))):
+			# Call another internal function of the coordinator
+			receive_message_from_coordinator("evaluate", request, 2)
+		else:
+			# Send non-local message to the other coordinator
+			send non-local message("evaluate", request, 2) to next coordinator(obj(request, 2))
+
+
+	# On receipt of request message from another Coordinator.
+	def receive_message_from_coordinator(message, request, i):
+
+		if message == "evaluate":
+			# On receiving request as coordinator(obj(request, i))
+			object = obj(request, i)
+
+			# Check if request contains might_update_obj.
+			# If the value of might_update_obj in the request is None, then it is 'Read' request else 'Write' request.
+			if request.might_update_obj == None:
+				# Evaluating read request.
+
+				# Updating the read timestamp of definetely read attributes to current timestamp.
+				for attribute in defReadAttr(object, request):
+					latestVersionBefore(object, attribute, request.timestamp).read_timestamp = request.timestamp
+
+				# Add might read attributes to the pendingMightRead list with request id and current timestamp.
+				for attribute in mightReadAttr(object, request):
+					latestVersionBefore(object, attribute, request.timestamp).pendingMightRead.add(request.id)
+
+			else:
+				# Evaluating update request.
+
+				# Add definetely read and might read attributes to the pendingMightRead list with request id and current timestamp.
+				for attribute in defReadAttr(object, request) union mightReadAttr(object, request):
+					latestVersionBefore(object, attribute, request.timestamp).pendingMightRead.add(request.id)
+
+			# Determining worker for request evaluation.
+			worker = determineWorker()
+
+			# Piggyback cached updates on the request.
+			request.cachedUpdates[i] = cachedUpdates(cacheDB, object, request, request.timestamp)
+
+			# Send local message to the other coordinator
+			send local message("evaluate_policy", request) to worker
+
+		# This section is actioned when the read-only coordinator receives message from write coordinator after write is committed.
+		# This message is used to update the read timestamp of the attributes read during request evaluation.
+		elif message == "readAttr":
+			# Update read timestamps.
+			for attribute in defReadAttr(object, request) union mightReadAttr(object, request):
+				v = latestVersionBefore(object, attribute, request.timestamp)
+
+				# Remove request entry from pendingMightRead queue.
+				v.pendingMightRead.remove(request.id)
+
+				# Update read timestamp of the version if the attribute is read during evaluation.
+				if attribute in request.readAttr[request.updatedObj]:
+					v.read_timestamp = request.timestamp
+
+
+	# On receipt of request message from Worker after request evaluation.
+	def receive_message_from_worker(message, request, i):
+
+		if message == "readAttr" && request.updatedObj == -1:
+			# This is for read request.
+			# Update timestamp of mightReadAttr after decision is evaluated by the worker.
+
+			object = obj(request, i)
+			for attribute in mightReadAttr(object, request)
+				v = latestVersionBefore(object, attribute, request.timestamp)
+				v.pendingMightRead.remove(request.id)
+
+				if attribute in request.readAttr[i]:
+					v.read_timestamp = request.timestamp
+
+		elif message == "result":
+			# This is for update request.
+			# On receiving <"result", request> as coordinator(obj(request, request.updatedObj))
+			# The request is suppose to update the object that this coordinator is responsible for handling.
+			object = obj(request, request.updatedObj)
+
+			# Add might write attributes to the pendingMightWrite list with request id.
+			# Adding to pendingMightWrite request will help us prevent starvation of write request due to excessive read request.
+			for attribute in request.updatedAttr:
+				latestVersionBefore(object, attribute, request.timestamp).pendingMightWrite.add(request.id)
+
+			# Check whether there are already known conflicts.
+			conflict = checkForConflicts()
+
+			# Actions based on conflict detection.
+			if not conflict:
+				# No conflict found.
+
+				# Wait for relevant pending reads to complete i.e., one the below conditions should satisfy.
+				# 1. Wait until pendingMightRead list is empty i.e., none of the attributes updated are in the pendingMightRead list.
+				# 2. Wait until only the entry of the request itself is there in the pendingMightRead list.
+				await (forall <attribute, value> in request.updatedAttr:
+						latestVersionBefore(object, attribute, request.timestamp).pendingMightRead == [] 
+						or (len(latestVersionBefore(object, attribute, request.timestamp).pendingMightRead) == 1 
+						&& attribute in latestVersionBefore(object, attribute, request.timestamp).pendingMightRead)
+
+				# Check again for conflict.
+				conflict = checkForConflicts()
+
+				# Action after conflict check.
+				if not conflict:
+
+					# Commit the updates
+
+					# Update Database with timestamp to create a new version of the data.
+					# The pseudocode for DB update has been ommitted in this document.
+					updateDB(object, request.updatedAttr, request.timestamp)
+
+					# Update cacheDB with the latest value
+					performCacheUpdates(cacheDB, object, request, request.updatedAttr, request.timestamp)
+
+					# Update latestVersionBefore map with a new version 
+					updatelatestVersion(data_versions, object, request.updatedAttr, request.timestamp)
+
+					# Update read timestamps.
+					for attribute in defReadAttr(object, request) union mightReadAttr(object, request):
+						v = latestVersionBefore(object, attribute, request.timestamp)
+
+						# Remove request entry from pendingMightRead queue.
+						v.pendingMightRead.remove(request.id)
+
+						# Update read timestamp of the version if the attribute is read during evaluation.
+						if attribute in request.readAttr[request.updatedObj]:
+							v.read_timestamp = request.timestamp
+
+					# Remove request entry from pendingMightWrite queue.
+					for attribute in request.updatedAttr:
+						latestVersionBefore(object, attribute, request.timestamp).pendingMightWrite.remove(request.id)
+
+					# Send the decision to the client after update is successful.
+					send non-local message("result", request) to request.client
+
+					# Notify coordinator of read-only object that request committed, so it can update read timestamps.
+					send non-local message("readAttr", request, request.rdonlyObj) to coordinator(obj(request, request.rdonlyObj))
+
+				else:
+					# Restart request if conflict.
+					# Remove pending might read/write entry made on the coordinator for the request.
+
+					# Remove request entry from pendingMightWrite queue.
+					for attribute in request.updatedAttr:
+						latestVersionBefore(object, attribute, request.timestamp).pendingMightWrite.remove(request.id)
+
+					# Remove request entry from pendingMightRead queue.
+					for attribute in defReadAttr(object, request) union mightReadAttr(object, request):
+						latestVersionBefore(object, attribute, request.timestamp).pendingMightRead.remove(request.id)
+
+					restart(request)
+			else:
+				# Restart request if conflict.
+				# Remove pending might read/write entry made on the coordinator for the request.
+
+				# Remove request entry from pendingMightWrite queue.
+				for attribute in request.updatedAttr:
+					latestVersionBefore(object, attribute, request.timestamp).pendingMightWrite.remove(request.id)
+
+				# Remove request entry from pendingMightRead queue.
+				for attribute in defReadAttr(object, request) union mightReadAttr(object, request):
+					latestVersionBefore(object, attribute, request.timestamp).pendingMightRead.remove(request.id)
+
+				restart(request)
+
+
+	# On receipt of restart request message from Coordinator.
+	def receive_restart_message(message, request):
+		# Remove pending might read entry made on the coordinator for the request.
+		v = latestVersionBefore(object, attribute, request.timestamp)
+		v.pendingMightRead.remove(request.id)
+		v.pendingMightWrite.remove(request.id)
+
+		# Get the current timestamp from function now().
+		timestamp = now()
+
+		# Piggyback timestamp on to the request.
+		request.timestamp = timestamp
+
+		# Add definetely read and might read attributes to the pendingMightRead list with request id and current timestamp.
+		for attribute in defReadAttr(object, request) union mightReadAttr(object, request):
+			latestVersionBefore(object, attribute, request.timestamp).pendingMightRead.add(request.id)
+
+		# Piggyback and override cached updates on the request.
+		request.cachedUpdates[1] = cachedUpdates(cacheDB, object, request, request.timestamp)
+
+		# Check if the coordinator for obj(request, request.updatedObj) is same as current coordinator.
+		# If yes, then call function within coordinator which perform further steps.
+		# If no, send a non-local message to coordinator responsible for further processing.
+		if (coordinator(obj(request, request.updatedObj)) == coordinator(obj(request, request.rdonlyObj))):
+			# Call another internal function of the coordinator
+			receive_message_from_coordinator("evaluate", request, 2)
+		else:
+			# Send non-local message to the other coordinator
+			send non-local message("evaluate", request, 2) to next coordinator(obj(request, request.updatedObj))
+
+/* Coordinator pseudocode ends here */
+
+
+/* Worker pseudocode starts here */
+
+##############################################################################################################
+# Worker receives the request from the local coordinator for request evaluation.
+# Worker does the policy evaluation and figures out:
+# 1. The decision whether to permit or deny.
+# 2. The object(i) and object(i).attributes to be updated for write request and none for read request.
+# 3. The attributes read during the evaluation of the request.
+# If read request, send the decision to the client and send the list of attributes read from each object(i) during evaluation to the coordinator #--responsible for evaluating the object(i).
+# If write request, send the request to the coordinator for updating the object(i) which the worker has specified to be the object to be updated.  
+##############################################################################################################
+
+Process Worker:
+
+	# This variable stores the id coordinator local to the worker.
+	# The pseudocode details for getCoordinatorId() has been ommitted; but it should be a simple process id extraction.
+	worker_coord = getCoordinatorId()
+
+	# On receiving request evaluation request from the Coordinator
+	def receive_request_evaluation(message, request):
+		# Evaluate request using the latest version before request.timestamp
+
+		# Evaluation of policy will emit:
+		# decision -> decision to permit or deny.
+		# updatedObj -> index (1 or 2) of the updated object, otherwise -1.
+		# updatedAttr -> set of attribute to be updated and the value to be updated for them. If read request, then empty set.
+		# updatedAttr is of the form set(<attribute, value>).
+		# readAttr -> nested list of attributes of obj(request, i) read during evaluation.
+		# readAttr is of the form [readAttr(1), readAttr(2)] where readAttr(i) is the list of read attributes for obj(request, i).
+		# Pseudocode for evaluatePolicy function is specific to the policy semantics and hence has not been mentioned here.
+		(decision, updatedObj, updatedAttr, readAttr) = evaluatePolicy(request)
+
+		# Piggyback on the request, the values received after evaluation of the request.
+		request.decision = decision
+		request.updatedObj = updatedObj
+		request.updatedAttr = updatedAttr
+
+		# If updatedObj > 0, this is the index (1 or 2) of the other object, otherwise -1.
+		if updatedObj > 0:
+			if updatedObj == 1:
+				request.rdonlyObj = 2
+			elif updatedObj == 2:
+				request.rdonlyObj = 1
+		else:
+			request.rdonlyObj = -1
+
+		# Piggyback on the request, the read attributes for each obj(request, i).
+		for i in [1..2]:  
+			request.readAttr[i] = readAttr[i]
+
+		# Action based on updatedObj value. 
+		if request.updatedObj == -1
+			# Request is read-only.
+			send non-local message(request.id, request.decision) to request.client
+
+			# Send the attributes read during evaluation for each obj(request, i) to coordinator(obj(request, i))
+			# Using the sequence mentioned at the start of the pseudocode, coordinator(obj(request, 2)) is where worker resides for read-only requests.
+			for i in [1..2]:
+				if i == 1:
+					send non-local message("readAttr", request, i) to coordinator(obj(request, i))
+				else:
+					send local message("readAttr", request, i) to coordinator(obj(request, i))
+		else:
+			# Request updated an object.
+
+			# If client predicted correctly the object to be updated; then local message is sent, else non-local message is required.
+			if worker_coord == coordinator(request.updatedObj):
+				send local message("result", request) to coordinator(obj(request, request.updatedObj))
+			else:
+				send non-local message("result", request) to coordinator(obj(request, request.updatedObj))
+
+/* Worker pseudocode ends here */
+
+/* Generic functions pseudocode starts here */
+
+# For selecting object to process in request evaluation.
+def obj(request, i): 
+	returns the object whose coordinator should process the request first (if i=1) or second (if i=2).
+
+# For object passed in the parameter, figure out the coordinator responsible for its execution.
+def coordinator(object):
+	return coord(object)
+
+# This function fetches data from the cacheDB based on the id of the subject/resource.
+# object - value can be either subject or resource.
+# request - request is used to extract the id.
+def cachedUpdates(cacheDB, object, request, timestamp):
+	if object == 'subject':
+		return cacheDB.get(<request.subject_id, timestamp>)
+	elif object == 'resource':
+		return cacheDB.get(<request.resource_id, timestamp>)
+
+# This function updates data of the cacheDB based on the id of the subject/resource.
+# object - value can be either subject or resource.
+# request - request is used to extract the id for updating cache.
+# data - data to be updated in the cacheDB.
+def performCacheUpdates(cacheDB, object, request, data, timestamp):
+	if object == 'subject':
+		cacheDB.update({<request.subject_id, timestamp>, data})
+	elif object == 'resource':
+		cacheDB.update({<request.resource_id, timestamp>, data})
+
+# This function takes care of latest version of data inserted into the data_versions data structure.
+# data_versions - list storing various version of the object and its attribute/values with timestamp.
+# object - object for which version information needs to be extracted.
+# attributes - list[<attribute, value>] of the object for which version information needs to be extracted.
+# Since the data is stored in the list in desc write timestamp stored manner, the first entry will give the latest version.
+def updatelatestVersion(data_versions, object, attributes, read_timestamp, write_timestamp):
+	for attribute, value in attributes:
+		ver = version()
+		ver.object = object
+		ver.attribute = attribute
+		ver.value = value
+		ver.write_timestamp = write_timestamp
+		ver.read_timestamp = read_timestamp
+		ver.pendingMightRead = []
+		ver.pendingMightWrite = []
+		data_versions.add(ver)
+
+# This function takes care of providing the latest version of data inserted into the data_versions data structure before the timestamp. 
+# data_versions - list storing various version of the object and its attribute/values with timestamp.
+# object - object for which version information needs to be extracted.
+# attribute - attribute of the object for which version information needs to be extracted.
+# timestamp - timestamp to extract the version before the specified timestamp.
+# Since the data is stored in list in desc write timestamp stored manner, the first entry with write timestamp lesser than required timestamp will be #--the result.
+# If no last version before exists, then this function returns a special version v with v.write_timestamp=0 and v.read_timestamp=0.
+# This special version represents the last version written in the previous session.
+# This special version is created on demand, when it is first needed.
+def latestVersionBefore(data_versions, object, attribute, timestamp):
+	# Extract data for the version before the timestamp.
+
+	# Extract the list of data data_versions given object and attribute.
+	list_version = []
+	for version in data_versions:
+		if version.object == object && version.attribute == attribute:
+			list_version.add(version)
+
+	# If no last version before exists.
+	if list_version == []:
+		ver = version()
+		ver.read_timestamp = 0
+		ver.write_timestamp = 0
+		return ver
+
+	# Iterate through the list of version and return the first version with timestamp less than timestamp in the function parameter.
+	for version in list_version:
+		if version.write_timestamp < timestamp:
+			return version
+
+# Check for conflicts by comparing timestamp of the attributes in the version before the timestamp of the request with the timestamp of the request.
+# If the read_timestamp of the version is greater than timestamp of the request, then we say conflict exists.
+def checkForConflicts(object, request):
+	for <attribute, value> in request.updatedAttr:
+		version = latestVersionBefore(object, attribute, request.timestamp)
+		if version.read_timestamp > request.timestamp:
+			return true
+	return false
+
+# In case of conflict, restart is required.
+# When restarting the request evaluation, it is necessary to clear off the pendingMightRead/pendingMightWrite to avoid any unnecessary wait to #--happen for other write/read request.
+def restart(request):
+	send non-local message("restart", request) to coordinator(obj(request, request.rdonlyObj))
+
+/* Generic functions pseudocode ends here */

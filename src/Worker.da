@@ -1,0 +1,213 @@
+import xml.etree.ElementTree as ET
+from configparser import ConfigParser
+import time
+
+
+# This class takes care of the policy evaluation for any request
+# It returns authorization decision to subject coordinator along with suggested updates to be done in db
+class Worker(process):
+
+    # This is the initial setup function which is used for initialization of data required for processing of this class.
+    def setup(worker_id, coordinator_dict, client_dict, dedicated_workers_dict, config_file, database):
+        output("Setting up Worker...")
+        self.worker_id = worker_id
+        self.coordinator_dict = coordinator_dict
+        self.client_dict = client_dict
+        self.dedicated_workers_dict = dedicated_workers_dict
+        self.config_file = config_file
+        self.database = database
+        self.policy_file = ''
+        self.global_dict = dict()
+        self.cached_data = dict()
+        self.readAttr = {}
+        self.sleep_time = 0
+
+    # This method does the policy parsing xml functionality
+    def evaluate_policy(request, file_path):
+        tree = ET.parse(file_path)
+        root = tree.getroot()
+        dict = {}
+        data = None
+        count = 0
+
+        data = request['res_cache_updates']
+
+        for rule in root.iter('rule'):
+            sub_id = ''
+            res_id = ''
+            balance = ''
+            count += 1
+            read_attribute = []
+            sc = rule[0].attrib
+
+            if sc:
+                sub_id = sc['customer_id']
+                if 'history' in sc:
+                    history = sc['history']
+                    read_attribute.append('history')
+                if 'status' in sc:
+                    status = 'status'
+                    read_attribute.append('status')
+
+            readAttr['subject'] = read_attribute
+            read_attribute = []
+
+            rc = rule[1].attrib
+            if rc:
+                res_id = rc['account_id']
+                if 'balance' in rc:
+                    balance = rc['account_bal']
+                    readAttr.append('account_bal')
+
+            readAttr['resource'] = read_attribute
+            if "<" in balance or ">" in balance:
+
+                if "<" in balance:
+                    if balance < data[0][1]:
+                        output("Balance checked")
+                    else:
+                        return None
+                else:
+                    if balance > data[0][1]:
+                        output("Balance checked")
+                    else:
+                        return None
+
+            act = rule.find('action')
+            action = act.attrib['name']
+
+            if len(rule) == 4:
+                if 'subjectUpdate' in rule[3].tag:
+                    su = rule[3]
+                    update_tuple = ()
+                    if 'history' in su.attrib:
+                        val = su.attrib['history']
+                        if val.find('$') != -1 and '_id' in val:
+                            update_tuple = ('history', res_id)
+
+                    elif 'status' in su.attrib:
+                        val = su.attrib['status']
+                        update_tuple = ("status", val)
+
+                    dict.update({(sub_id, res_id, action): ('subjectUpdate', update_tuple)})
+                elif 'resourceUpdate' in rule[3].tag:
+                    ru = rule[3]
+
+                    # Check Len of data 1
+                    if data and len(data) > 2:
+                        account_bal = data[0][1]
+                    else:
+                        account_bal = 0
+
+                    if '++' in ru.attrib['account_bal']:
+                        account_bal += int(ru.attrib['account_bal'].replace('++', ''))
+                    elif '--' in ru.attrib['account_bal']:
+                        account_bal -= int(ru.attrib['account_bal'].replace('--', ''))
+
+                    dict.update({(sub_id, res_id, action): ('resourceUpdate', ('account_bal', account_bal))})
+            else:
+                dict.update({(sub_id, res_id, action): ('')})
+
+        output("Dictionary: " + str(dict))
+        return dict
+
+    # This is the first function being called when worker process is started
+    def run():
+        get_configuration()
+        output("Worker Process " + str(worker_id) + " coming up...")
+        await(received(('terminate',)))
+        output("Terminated Worker: " + str(worker_id) + " ...")
+
+    # Invoked when coord2 sends request decision to worker
+    def receive(msg=('evaluate_policy', request), from_=Coordinator):
+        output("Worker " + str(worker_id) + " Received Policy Evaluation [Request: " + str(
+            request['req_id']) + " , Client: " + str(request['client_id']) + "] with [Coordinator-1: " + str(
+            request['coord_id1']) + " , Coordinator-2: " + str(request['coord_id2']) + "]")
+        output("Request Message: " + str(request))
+
+        # read zero_latency from config file
+        config = ConfigParser()
+        config.read(config_file)
+        zero_latency = int(config.get('SystemConfiguration', 'zero_latency'))
+        if zero_latency == 1:
+            req_id = request['req_id']
+            output("zero_latency set to evaluate performance")
+            request.update({'decision': 'True'})
+            if request['action_id'] == 'read':
+                send(('decision-perf-eval', req_id), to=client_dict[request['client_id']])
+            elif request['action_id'] == 'update':
+                client_prediction = int(config.get('SystemConfiguration', 'client_prediction'))
+                if client_prediction == 1:
+                    output("client prediction true: sending to coord2")
+                    send(('update-decision-perf-eval', request), to=coordinator_dict[request['coord_id2']])
+                else:
+                    output("client prediction flase: sending to coord1")
+                    send(('update-decision-perf-eval', request), to=coordinator_dict[request['coord_id1']])
+
+        else:
+            # getEvalDecision
+            global_dict = evaluate_policy(request, policy_file)
+
+        if (request['subject_id'], request['resource_id'], request['action_id']) in global_dict:
+            request.update({'decision': 'True'})
+            update_object = global_dict[(request['subject_id'], request['resource_id'], request['action_id'])]
+        else:
+            request.update({'decision': 'False'})
+            update_object = ''
+
+        if '' in update_object:
+            request.update({'updatedObj': ''})
+            request.update({'readonlyObj': ''})
+        else:
+            if 'subject' in update_object[0]:
+                request.update({'updatedObj': 'subject'})
+                request.update({'updatedAttr': update_object[1]})
+                request.update({'readonlyObj': 'resource'})
+            else:
+                request.update({'updatedObj': 'resource'})
+                request.update({'updatedAttr': update_object[1]})
+                request.update({'readonlyObj': 'subject'})
+
+        prediction = True
+        if '' not in update_object:
+            if request['might_update_obj'] == request['updatedObj']:
+                prediction = True
+            else:
+                prediction = False
+                if request['coord_id1'] != request['coord_id2']:
+                    request['coord_id1'] = request['wrong_coord']
+
+            output("Result of Prediction: " + str(prediction))
+
+        output("Piggyback Data")
+        # Piggyback on the request, the read attributes for each obj(request, i).
+        request.update({'readAttr' + 'subject': readAttr['subject']})
+        request.update({'readAttr' + 'resource': readAttr['resource']})
+
+        if request['client_id'] == 1:
+            time.sleep(int(sleep_time))
+
+        if '' in update_object:
+            send(('read-decision', request['req_id'], request['decision']), to=client_dict[request['client_id']])
+            request.update({'object': 'subject'})
+            send(('update-decision', request), to=coordinator_dict[request['coord_id1']])
+            request.update({'object': 'resource'})
+            send(('update-decision', request), to=coordinator_dict[request['coord_id2']])
+        else:
+            request.update({'object': request['updatedObj']})
+            if prediction:
+                output("Sending Update Decision to Coordinator: " + str(request['coord_id2']))
+                send(('update-decision', request), to=coordinator_dict[request['coord_id2']])
+            else:
+                output("Prediction of client was False.")
+                output("Received Update Decision Request from Coordinator: " + str(request['coord_id2']))
+                output("Sending Update Decision to Coordinator: " + str(request['coord_id1']))
+                send(('update-decision', request), to=coordinator_dict[request['coord_id1']])
+
+    # Loading configuration from the properties file
+    def get_configuration():
+        output("Reading Configuration from properties file")
+        config = ConfigParser()
+        config.read(config_file)
+        policy_file = config.get('SystemConfiguration', 'policy_file')
+        sleep_time = config.get('SystemConfiguration', 'sleep_time')

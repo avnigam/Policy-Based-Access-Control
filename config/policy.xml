@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<!-- sample policy.  CSE 535, Fall 2016, Scott Stoller.  2016-10-03 -->
+<policy>
+  
+  <rule name="access bank first time">
+    <subjectCondition customer_id="cust_A" history="empty"></subjectCondition>
+    <resourceCondition account_id="2"></resourceCondition>
+    <action name="update"></action>
+    <subjectUpdate history="$account_id"></subjectUpdate>
+  </rule>
+
+  <rule name="access bank account again">
+    <subjectCondition customer_id="cust_A"></subjectCondition>
+    <resourceCondition account_id="1"></resourceCondition>
+    <action name="read"></action>
+  </rule>
+
+  <rule name="update customer status for active customer">
+    <subjectCondition customer_id="cust_C"></subjectCondition>
+    <resourceCondition account_id="3"></resourceCondition>
+    <action name="update"></action>
+    <subjectUpdate status="active"></subjectUpdate>
+  </rule>
+
+  <rule name="add balance to account">
+    <subjectCondition customer_id="Cust_E" status = "active"></subjectCondition>
+    <resourceCondition account_id="3"></resourceCondition>
+    <action name="update"></action>
+    <resourceUpdate account_bal="++50"></resourceUpdate>
+  </rule>
+
+  <rule name="check account balance">
+    <subjectCondition customer_id="cust_B" status = "active"></subjectCondition>
+    <resourceCondition account_id="2" account_bal=">100"></resourceCondition>
+    <action name="read"></action>
+  </rule>
+
+<!--
+  <rule name="deactivate customer">
+    <subjectCondition customer_id="1" status = "active"></subjectCondition>
+    <resourceCondition account_id="1" account_bal="<100"></resourceCondition>
+    <action name="read"></action>
+    <subjectUpdate status="inactive"></subjectUpdate>
+  </rule>
+-->
+
+</policy>

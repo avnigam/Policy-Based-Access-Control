@@ -1,0 +1,10 @@
+cust_A,1,read --> subject.customer_id,subject.history,resource.account_id
+cust_A,2,update --> subject.customer_id,resource.account_id
+cust_B,1,read --> subject.customer_id,subject.history,resource.account_id
+cust_B,2,update --> subject.customer_id,resource.account_id
+cust_C,1,read --> subject.customer_id,subject.history,resource.account_id
+cust_C,2,update --> subject.customer_id,resource.account_id
+cust_D,1,read --> subject.customer_id,subject.history,resource.account_id
+cust_D,2,update --> subject.customer_id,resource.account_id
+cust_E,1,read --> subject.customer_id,subject.history,resource.account_id
+cust_E,2,update --> subject.customer_id,resource.account_id

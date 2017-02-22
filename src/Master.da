@@ -1,0 +1,121 @@
+import sys
+import os
+import random
+import subprocess
+from configparser import ConfigParser
+import time
+import xml.etree.ElementTree as ET
+
+Worker = import_da('Worker').Worker
+Client = import_da('Client').Client
+Coordinator = import_da('Coordinator').Coordinator
+Database = import_da('Database').Database
+
+
+class Master(process):
+
+    # first method called when application starts master process
+    def setup(master, config_file, client_list, coordinator_list, database, client_dict, coordinator_dict):
+        self.master = master
+        self.client_count = 0
+        self.config_file = config_file
+        self.client_list = client_list
+        self.coordinator_list = coordinator_list
+        self.database = database
+        self.client_dict = client_dict
+        self.coordinator_dict = coordinator_dict
+        output("Master coming up...")
+
+    # exit mechanism
+    def run():
+        nclients = len(client_list)
+        ncoordinators = len(coordinator_list)
+        await(client_count == nclients)
+        output("Terminating all processes")
+        for i in range(nclients):
+            send(('terminate',), to=client_dict[i + 1])
+        for i in range(ncoordinators):
+            send(('terminate',), to=coordinator_dict[i + 1])
+        time.sleep(10)
+        send(('terminate',), to=database)
+        output("Terminated Master")
+
+    # on receipt of termination request from client
+    def receive(msg=('exhausted',), from_=Client):
+        output("I got the request for termiantion from Client" + str(client_count + 1))
+        client_count += 1
+
+
+# main method to start application
+def main():
+    print("Starting Processes...")
+
+    # Read configuration form user-specified config file
+    config = ConfigParser()
+    config.read(sys.argv[1])
+    print(config.sections())
+    config_file = sys.argv[1]
+    # read number of clients from configuration file
+    nclients = int(config.get('SystemConfiguration', 'no_of_clients'))
+    # number of coordinators
+    ncoordinators = int(config.get('SystemConfiguration', 'no_of_coordinators'))
+    # number of coordinators
+    nworkers = int(config.get('SystemConfiguration', 'no_of_workers_per_coordinator'))
+
+    # Create Master Process
+    master = new(Master, arg=(), at='Master')
+
+    # Create DB process
+    output("Database coming up...")
+    database = new(Database, arg=(), at='Database')
+
+    # Create client processes
+    output("number of clients to be created.." + str(nclients))
+    client_dict = {}
+    client_set = new(Client, num=nclients, at='Client')
+    client_list = list(client_set)
+    output("number of clients..." + str(len(client_list)))
+    output(client_list)
+    for i in range(nclients):
+        client_id = i + 1
+        client_dict.update({client_id: client_list[i]})
+
+    # Create Coordinator processes
+    coordinator_dict = {}
+    coordinator_list = []
+    for i in range(ncoordinators):
+        coordinator_id = i + 1
+        node_name = 'Coordinator_' + str(coordinator_id)
+        coordinator = new(Coordinator, arg=(), at=node_name)
+        coordinator_list.append(coordinator)
+        output("Coordinators coming up..." + str(ncoordinators))
+        coordinator_dict.update({coordinator_id: coordinator})
+
+    # Setup and start master, database , client 
+    # create dedicated workers for each coordinator, setup and start them
+    # setup and start coordinators
+    setup(master, (master, sys.argv[1], client_list, coordinator_list, database, client_dict, coordinator_dict))
+    start(master)
+    setup(database, (coordinator_dict, config_file))
+    start(database)
+    for i in range(len(client_list)):
+        setup(client_list[i], (i + 1, coordinator_dict, client_dict, master, config_file))
+        start(client_list[i])
+    for i in range(len(coordinator_list)):
+        # Configure Dedicated Workers for this Coordinator on the same node
+        output("Workers per Coordinators coming up..." + str(nworkers))
+        node_name = 'Coordinator_' + str(i + 1)
+        dedicated_workers_dict = {}
+        dedicated_workers_list = []
+        for w in range(nworkers):
+            worker = new(Worker, arg=(), at=node_name)
+            worker_id = w
+            dedicated_workers_list.append(worker)
+            dedicated_workers_dict.update({worker_id: worker})
+        for j in range(len(dedicated_workers_list)):
+            setup(dedicated_workers_list[j],
+                  (worker_id, coordinator_dict, client_dict, dedicated_workers_dict, config_file, database))
+            start(dedicated_workers_list[j])
+        setup(coordinator_list[i], (
+        i + 1, client_dict, coordinator_dict, database, ncoordinators, nworkers, dedicated_workers_dict, config_file))
+        start(coordinator_list[i])

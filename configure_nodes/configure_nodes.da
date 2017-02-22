@@ -1,0 +1,48 @@
+import sys
+import subprocess
+import time
+from configparser import ConfigParser
+# start nodes for various process required
+# nclient nodes for client processes
+# ncoordinators nodes for coordinator processes
+# nworkers will reside on each coordinator's node
+
+def main(): 
+    # Read configuration form user-specified config file
+    config = ConfigParser()
+    config.read(sys.argv[1])
+    config_file = sys.argv[1]
+    #read number of clients from configuration file
+    nclients = int(config.get('SystemConfiguration', 'no_of_clients'))
+    #number of coordinators
+    ncoordinators = int(config.get('SystemConfiguration', 'no_of_coordinators'))
+    #number of coordinators
+    nworkers = int(config.get('SystemConfiguration', 'no_of_workers_per_coordinator'))
+
+    # start Master node 
+    node_name = 'Master'
+    cmd = 'python -m da -n '+ node_name + ' --master -f --logfilename logs/' + node_name + '.log -L info -D src/Master.da'
+    #cmd ='python -m da -n '+ node_name + ' --master -D src/Master.da'
+    subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
+    time.sleep(1)
+
+    # start Database node
+    node_name = 'Database'
+    cmd ='python -m da -n '+ node_name + ' -f --logfilename logs/' + node_name + '.log -L info -D src/Database.da'
+    subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
+    time.sleep(1)
+
+    # start Client node
+    #time.sleep(5)
+    node_name = 'Client'
+    cmd ='python -m da -n '+ node_name + ' -f --logfilename logs/' + node_name + '.log -L info -D src/Client.da'
+    subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
+    
+    # start Coordinator nodes
+    for i in range(ncoordinators):
+        #time.sleep(2)
+        node_name = "Coordinator_"+str(i+1)
+        cmd ='python -m da -n '+ node_name + ' -f --logfilename logs/' + node_name + '.log -L info -D src/Coordinator.da'
+        subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+    print("Nodes Configured, please proceed!!")

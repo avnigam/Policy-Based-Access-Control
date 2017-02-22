@@ -1,0 +1,290 @@
+import sys
+import random
+from configparser import ConfigParser
+import time
+import xml.etree.ElementTree as ET
+import csv
+
+
+class Client(process):
+
+    def setup(client_id, coordinator_dict, client_dict, master, config_file):
+        output("Client " + str(client_id) + " coming up...")
+        # data-structure passed by Master
+        self.client_id = client_id
+        self.client_dict = client_dict
+        self.coordinator_dict = coordinator_dict
+        self.master = master
+        self.config_file = config_file
+        # data structure created by client
+        self.request_list = []
+        self.information_map = {}
+        self.nrequests = 0
+        self.sent_request_queue = []
+        self.policy = {}
+        self.prediction = True
+        self.start_time = 0
+        self.end_time = 0
+        self.perf_eval_data = []
+
+    # This function is called when the request order is explicit.
+    def get_request_list(request_seq):
+        requests = request_seq.split(':')
+
+        for request in requests:
+            attr = request.split(',')
+            sub_id = attr[0].strip()
+            res_id = attr[1].strip()
+            action = attr[2].strip()
+
+            request_list.append((sub_id, res_id, action))
+
+        output("Request List: " + str(request_list))
+        return request_list
+
+    # This function is called when the request order is needs to be randomly generated.
+    # subject - list of all the subjects taken from config file
+    # resource - list of all the resources taken from config file
+    # action - list of all the actions takens from config file
+    # list_size - no. of requests to be generated
+    def get_random_request_list(subject, resource, action, list_size):
+        subjects = subject.split(", ")
+        output(subject)
+        output(subjects)
+        resources = resource.split(", ")
+        actions = action.split(", ")
+
+        request_list = []
+
+        for i in range(list_size):
+            subj = subjects[random.randint(0, len(subjects) - 1)]
+            res = resources[random.randint(0, len(resources) - 1)]
+            act = actions[random.randint(0, len(actions) - 1)]
+
+            request_list.append((subj, res, act))
+
+        output("Request List: " + str(request_list))
+        return request_list
+
+    # This function loads the config file into the memory of the process
+    def readConfigData():
+        config = ConfigParser()
+        config.read(config_file)
+        dict = {}
+        no_of_coordinators = config.get('SystemConfiguration', 'no_of_coordinators')
+        dict.update({'no_of_coordinators': int(no_of_coordinators)})
+        client_workload = config.get('ClientConfiguration', 'client_workload')
+        dict.update({'client_workload': int(client_workload)})
+        sequence_type = config.get('ClientConfiguration', 'sequence_type')
+        dict.update({'sequence_type': sequence_type})
+        prediction = config.get('SystemConfiguration', 'prediction')
+
+        # Request sequence is determined based on configuration file.
+        if sequence_type == "RANDOM":
+            sequence_seed = config.get('ClientConfiguration', 'sequence_seed')
+            random.seed(sequence_seed)
+            # random.shuffle(sequence)
+            request_data = get_random_request_list(config.get('Data', 'subjects'),
+                                                   config.get('Data', 'resources'),
+                                                   config.get('Data', 'actions'),
+                                                   int(client_workload))
+        else:
+            request_data = get_request_list(config.get('Data', 'request_data'))
+            # random.shuffle(request_data)
+
+        dict.update({'request_data': request_data})
+        output("len of req_data: " + str(len(request_data)))
+        for request in request_data:
+            upd_obj = mightWriteObj(request)
+            output("Upd obj: " + str(upd_obj))
+            # (sid,rid,aid)=request
+            if request[2] == 'update':
+                output("action: " + str(request[2]))
+                information_map.update({request: upd_obj})
+        output("information_map: " + str(information_map))
+        return dict
+
+    # Based on static policy analysis and data available to the Client.
+    # Figure out if the request to be sent is of type Read or Write.
+    def requestType(request):
+        aid = request['action_id']
+        if aid == 'read':
+            return 'Read'
+        else:
+            return 'Update'
+
+    # This method does the policy parsing xml functionality
+    def parse_xml(file_path):
+        tree = ET.parse(file_path)
+        root = tree.getroot()
+        dict = {}
+        for rule in root.iter('rule'):
+            sub_id = ''
+            res_id = ''
+            sc = rule[0].attrib
+            if sc:
+                sub_id = sc['customer_id']
+            rc = rule[1].attrib
+            if rc:
+                res_id = rc['account_id']
+            act = rule.find('action')
+            action = act.attrib['name']
+            if len(rule) == 4 and 'subjectUpdate' in rule[3].tag:
+                dict.update({(sub_id, res_id, action): 'subjectUpdate'})
+            elif len(rule) == 4 and 'resourceUpdate' in rule[3].tag:
+                dict.update({(sub_id, res_id, action): 'resourceUpdate'})
+        return dict
+
+    # Figure out whether Subject or Resource object needs to be updated.
+    def mightWriteObj(request):
+        # policy semantics used to determine this
+        output("request: " + str(request))
+        if request in policy:
+            if policy[request] == 'subjectUpdate':
+                return 'subject'
+            elif policy[request] == 'resourceUpdate':
+                return 'resource'
+        else:
+            return ''
+
+    # For selecting object to process in request evaluation.
+    def obj(i):
+        if i == 1:
+            return 'subject'
+        if i == 2:
+            return 'resource'
+
+    # This function is used for determining the subject coordinator based on subject id.
+    def determineCoordinator1(request, obj_type, no_of_coordinators):
+        coord_id = 1
+        if obj_type == 'subject':
+            coord_id = hash(request['subject_id']) % no_of_coordinators + 1
+        elif obj_type == 'resource':
+            coord_id = hash(request['resource_id']) % no_of_coordinators + 1
+        return coord_id
+
+    # This is the first method which is called when the process is started.
+    # It reads configuration from config file and based on that starts sending requests.
+    def run():
+        output("Client " + str(client_id) + " coming up...")
+
+        # read and store policy data in a global object
+        config = ConfigParser()
+        config.read(config_file)
+        policy_file = config.get('SystemConfiguration', 'policy_file')
+        policy = parse_xml(policy_file)
+
+        # read client configuration to be used by the client 
+        client_config = readConfigData()
+        nrequests = client_config['client_workload']
+        output("Number of requests to be created for Client " + str(client_id) + ":" + str(nrequests))
+        ncoordinators = client_config['no_of_coordinators']
+        request_data = client_config['request_data']
+        # create requests objects and add it in the request queue
+        request_list = []
+        for i in range(nrequests):
+            request = {}
+            req_id = i + 1
+            (sub_id, res_id, action_id) = request_data[i]
+            request.update({'client_id': client_id})
+            request.update({'req_id': req_id})
+            request.update({'subject_id': sub_id})
+            request.update({'resource_id': res_id})
+            request.update({'action_id': action_id})
+            request_type = requestType(request)
+            if request_type == 'Read':
+                # For read request we choose Subject first but the order does not matter. 
+                obj_type = 'Subject'  # obj(1)
+                # For read request, we send might update object in the request as None.
+                request.update({'might_update_obj': ''})
+            elif request_type == 'Update':
+                # Figure out whether Subject or Resource object needs to be updated.
+                upd_obj = information_map[(sub_id, res_id, action_id)]
+                # For write request, we send might update object evaluated above in the request.
+
+                # We choose the object for which write might not happen, to receive the message from client.
+                # This is done in order to avoid the non-local message from worker to coordinator responsible for object writing. 
+                obj_type = ''
+                if i == 1:
+                    obj_type = 'resource'  # obj(2)
+                else:
+                    obj_type = 'subject'  # obj(1)
+
+                coord_id1 = determineCoordinator1(request, obj_type, ncoordinators)
+                if upd_obj == 'subject':
+                    obj_type = 'resource'
+                elif upd_obj == 'resource':
+                    obj_type = 'subject'
+
+                if prediction == '1':
+                    if upd_obj == 'subject':
+                        request.update({'wrong_coord': 1})
+                    else:
+                        request.update({'wrong_coord': 2})
+                    (upd_obj, obj_type) = (obj_type, upd_obj)
+
+                request.update({'might_update_obj': upd_obj})
+
+            coord_id1 = determineCoordinator1(request, obj_type, ncoordinators)
+            request.update({'coord_id1': coord_id1})
+            # Append the new request to client's request queue
+            request_list.append(request)
+        time.sleep(5)
+        # Send request message to the coordinator responsible for object evaluated above 
+        send(('send_req'), to=client_dict[client_id])
+
+        # Exit Mechanism
+        await(received(('terminate',)))
+        output("Terminated Client: " + str(client_id))
+        output("Successfully Terminated Client Processes...")
+
+    # This method sends the evaluation request from the client to first coordinator.
+    def receive(msg=('send_req'), from_=Client):
+        request = {}
+        next_req_index = len(sent_request_queue)
+        request = request_list[next_req_index]
+        output("Client " + str(request['client_id']) + " sending request " + str(
+            next_req_index + 1) + " to coordinator" + str(request['coord_id1']))
+        start_time = time.time()
+        send(('coord1_policy_eval', request), to=coordinator_dict[request['coord_id1']])
+        sent_request_queue.append(request)
+
+    # On receipt of decision for update request from Coordinator.
+    def receive(msg=('update-decision', request), from_=Coordinator):
+        output("client " + str(client_id) + "got the decision for update request: " + str(request['req_id']))
+        # Apply update to information_map for write requests.
+        # Update information_map with the updated object information received in the message.
+        information_map.update(
+            {(request['subject_id'], request['resource_id'], request['action_id']): request['updatedObj']})
+        if len(sent_request_queue) < nrequests:
+            send(('send_req'), to=client_dict[client_id])
+        else:
+            send(('exhausted',), to=master)
+
+    # On receipt of decision for read request from Worker.
+    def receive(msg=('read-decision', req_id, decision), from_=Worker):
+        output("client " + str(client_id) + " got the decision for read request: " + str(req_id))
+        if len(sent_request_queue) < nrequests:
+            send(('send_req'), to=client_dict[client_id])
+        else:
+            output("exhausted")
+            send(('exhausted',), to=master)
+
+    def receive(msg=('decision-perf-eval', req_id), from_=Coordinator):
+        output("client " + str(client_id) + "got the decision for update request: " + str('req_id'))
+        end_time = time.time()
+        time_taken = end_time - start_time
+        output("[Request " + str(req_id) + "] EVAL TIME: " + str(time_taken))
+        perf_eval_data.append(time_taken)
+        if len(sent_request_queue) < nrequests:
+            send(('send_req'), to=client_dict[client_id])
+        else:
+            with open('perf_eval_data_ph4.csv', 'w') as csvfile:
+                fieldnames = ['time_taken']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                output(str(perf_eval_data))
+                for item in perf_eval_data:
+                    writer.writerow({'time_taken': item})
+            output("exhausted")
+            send(('exhausted',), to=master)

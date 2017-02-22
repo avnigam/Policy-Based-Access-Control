@@ -1,0 +1,2 @@
+python -m da configure_nodes/configure_nodes.da config/basic-algo.properties
+python -m da -n Main -f –-logfilename logs/basic-algo.log -L info src/Master.da config/basic-algo.properties

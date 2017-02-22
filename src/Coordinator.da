@@ -1,0 +1,598 @@
+import random
+import time
+from configparser import ConfigParser
+
+from VersionDB import latestVersionBefore
+from VersionDB import print_version
+from VersionDB import update_latest_Version
+
+
+class Coordinator(process):
+    # This is the initial setup function which is used for initialization of data required for processing of this class.
+    def setup(coordinator_id, client_dict, coordinator_dict, database, no_of_coordinators,
+              no_of_workers_per_coordinator, dedicated_workers_dict, config_file):
+        output("Coordinator " + str(coordinator_id) + " is being setup")
+        # data-structure passed by Master
+        self.coordinator_id = coordinator_id
+        self.client_dict = client_dict
+        self.database = database
+        self.coordinator_dict = coordinator_dict
+        self.no_of_coordinators = no_of_coordinators
+        self.no_of_workers_per_coordinator = no_of_workers_per_coordinator
+        self.config_file = config_file
+        self.dedicated_workers_dict = dedicated_workers_dict
+        # data-structure created by Coordinator
+        self.subject_request_list = []
+        self.resource_request_list = []
+        self.subject_cache = {}
+        self.resource_cache = {}
+        self.def_read_attr_file = ''
+        self.might_read_attr_file = ''
+        self.def_read_attr_map = {}
+        self.might_read_attr_map = {}
+        self.list_version = []
+        self.cacheDB = {}
+        self.global_request_id = (coordinator_id * 1000) + 1
+
+    # This method determines the definitely read and tentatively read attributes
+    def get_attribute_classification(def_read_attr_conf, might_read_attr_conf):
+        def_read_attr_map = {}
+        might_read_attr_map = {}
+
+        with open(def_read_attr_conf) as f:
+            lines = f.readlines()
+            for line in lines:
+                val = line.split(' --> ')
+                def_keys = val[0].split(',')
+                def_read_attr = val[1].split(',')
+                def_read_attr_map.update({(def_keys[0], def_keys[1], def_keys[2]): def_read_attr})
+
+        with open(might_read_attr_conf) as f:
+            lines = f.readlines()
+            for line in lines:
+                val = line.split(' --> ')
+                might_keys = val[0].split(',')
+                might_read_attr = val[1].split(',')
+                might_read_attr_map.update({(might_keys[0], might_keys[1], might_keys[2]): might_read_attr})
+
+        return def_read_attr_map, might_read_attr_map
+
+    # This method loads DB Cache initially when Coordinator process starts
+    def loadDBCache():
+        output("Initial DB Cache Load")
+        send(('read', coordinator_id, 'dump', 0), to=database)
+        await(received(('cached',)))
+        output("Cache Loaded")
+
+    # This method assigns worker to resource coordinator for a given request
+    def determineWorker():
+        output("No. of workers per Coordinator " + str(no_of_workers_per_coordinator))
+        w_id = random.randint(0, no_of_workers_per_coordinator - 1)
+        output("w_id: " + str(w_id))
+        return w_id
+
+    def determineCoordinator2(request, obj_type, no_of_coordinators):
+        coord_id = 1
+        if obj_type == 'subject':
+            coord_id = hash(request['subject_id']) % no_of_coordinators + 1
+        elif obj_type == 'resource':
+            coord_id = hash(request['resource_id']) % no_of_coordinators + 1
+        return coord_id
+
+    def obj(request, i):
+        if i == 1:
+            return 'subject'
+        elif i == 2:
+            return 'resource'
+
+    def now():
+        return time.time()
+
+    def defReadAttr(obj_type, request):
+        output("Reading Def Read Attribute")
+        if (request['subject_id'], request['resource_id'], request['action_id']) in def_read_attr_map:
+            attr_list = def_read_attr_map[(request['subject_id'], request['resource_id'], request['action_id'])]
+            def_read_attr_list = []
+            for attrs in attr_list:
+                attr = attrs.split('.')
+                if obj_type == 'subject' and attr[0] == 'subject':
+                    def_read_attr_list.append(attr[1])
+                elif obj_type == 'resource' and attr[0] == 'resource':
+                    def_read_attr_list.append(attr[1])
+
+            return def_read_attr_list
+        else:
+            return []
+
+    def mightReadAttr(obj_type, request):
+
+        output("Reading Might Read Attribute")
+        if (request['subject_id'], request['resource_id'], request['action_id']) in might_read_attr_map:
+            attr_list = might_read_attr_map[(request['subject_id'], request['resource_id'], request['action_id'])]
+            might_read_attr_list = []
+            for attrs in attr_list:
+                attr = attrs.split('.')
+                if obj_type == 'subject' and attr[0] == 'subject':
+                    might_read_attr_list.append(attr[1])
+                elif obj_type == 'resource' and attr[0] == 'resource':
+                    might_read_attr_list.append(attr[1])
+
+            return might_read_attr_list
+        else:
+            return []
+
+    # Loading configuration from the properties file
+    def get_configuration():
+        output("Reading Configuration from properties file")
+        config = ConfigParser()
+        config.read(config_file)
+        def_read_attr_file = config.get('SystemConfiguration', 'def_read_attr_file')
+        might_read_attr_file = config.get('SystemConfiguration', 'might_read_attr_file')
+
+    # method invoked while piggybacking the cached updates in request object
+    def cachedUpdates(this_obj, request):
+        list_subject = []
+        list_resource = []
+
+        if this_obj == 'subject':
+            s_id = request['subject_id']
+            current_record = subject_cache[s_id]
+            status_version_list = current_record[1]
+            history_version_list = current_record[2]
+
+            for version in status_version_list:
+                if version[1] < request['timestamp']:
+                    list_subject.append(version)
+
+            for version in history_version_list:
+                if version[1] < request['timestamp']:
+                    list_subject.append(version)
+
+        elif this_obj == 'resource':
+            r_id = request['resource_id']
+            current_record = resource_cache[r_id]
+            account_bal_version_list = current_record[0]
+
+            for version in account_bal_version_list:
+                if version[1] < request['timestamp']:
+                    list_resource.append(version)
+
+        return list_subject, list_resource
+
+    def performCacheUpdates(request):
+        updatedAttr = request['updatedAttr']
+        if request['updatedObj'] == 'subject':
+            current_record = subject_cache[request['subject_id']]
+            for attr in updatedAttr[0]:
+                if attr == 'history':
+                    current_record[2].append((value, request['timestamp']))
+                    current_record[2] = sorted(current_record[2], key=lambda tup: tup[1], reversed=True)
+                elif attr == 'status':
+                    current_record[1].append((value, request['timestamp']))
+                    current_record[1] = sorted(current_record[1], key=lambda tup: tup[1], reversed=True)
+            subject_cache.update({request['subject_id']: (current_record[0], current_record[1], current_record[2])})
+        elif request['updatedObj'] == 'resource':
+            r_id = request['resource_id']
+            current_record = resource_cache[r_id]
+            for (attr, value) in updatedAttr:
+                if attr == 'account_bal':
+                    current_record[0].append((value, request['timestamp']))
+                    current_record[0] = sorted(current_record[0], key=lambda tup: tup[1], reversed=True)
+            resource_cache.update({r_id: (current_record[0], current_record[1], current_record[2])})
+
+    def run():
+        loadDBCache()
+        get_configuration()
+        (def_read_attr_map, might_read_attr_map) = get_attribute_classification(def_read_attr_file,
+                                                                                might_read_attr_file)
+        output("def_read_attr_map" + str(def_read_attr_map))
+        output("might_read_attr_map" + str(might_read_attr_map))
+        output("Coordinator " + str(coordinator_id) + " coming up...")
+        await(received(('terminate',)))
+        output("Termination has started")
+        output("Subject CacheDB: " + str(subject_cache))
+        output("Resource CacheDB: " + str(resource_cache))
+        output("Version DB")
+        for version in list_version:
+            output("Printing Version Database")
+            print_version(version)
+
+        for i in range(len(dedicated_workers_dict)):
+            send(('terminate',), to=dedicated_workers_dict[i])
+        output("Terminated Coordinator:" + str(coordinator_id))
+
+    # invoked when Database sends data from DB for loadinig initial cache
+    def receive(msg=('dump_sent', data), from_=Database):
+        output("Receiving data dump from DB")
+        output("Subject List : " + str(data[0]))
+        output("Resource List : " + str(data[1]))
+        subject_cache = data[0]
+        resource_cache = data[1]
+        output("Subject cache : " + str(subject_cache))
+        output("Resource cache : " + str(resource_cache))
+        send(('cached',), to=coordinator_dict[coordinator_id])
+
+    def noPendingMightWriteAttr(attr_list, this_obj, timestamp, request):
+        i = 0
+        while True:
+            if i < 5:
+                output("Waiting to Prevent Starvation")
+                output("Waiting Request: " + str(request['req_id']) + " from Client: " + str(request['client_id']))
+                i += 1
+
+            flag = True
+            for attr in attr_list:
+                if latestVersionBefore(list_version, this_obj, attr, timestamp).pendingMightWrite:
+                    flag = False
+
+            if time.time() - timestamp > 5:
+                return True
+
+            if flag == True:
+                return True
+
+    def noPendingMightReadAttr(attr_list, this_obj, timestamp, request):
+        timestamp = time.time()
+        i = 0
+        while (True):
+            if i < 5:
+                output("Write Request is Pending")
+                i += 1
+
+            flag = True
+            for attr in attr_list:
+                list = latestVersionBefore(list_version, this_obj, attr, timestamp)
+                if list and list.pendingMightRead:
+                    output("Length of Pending Might Read for attribute: " + str(attr) + " is " + str(
+                        len([(set(list.pendingMightRead))])))
+
+                if list and list.pendingMightRead != [] and len([(set(list.pendingMightRead))]) != 1:
+                    flag = False
+
+            if time.time() - timestamp > 5:
+                return True
+
+            if flag == True:
+                output("Exiting await......")
+                return True
+
+    # invoked when client sends the request for policy evaluation to coord 1
+    def receive(msg=('coord1_policy_eval', request), from_=Client):
+        output("Coord " + str(coordinator_id) + " received Policy Evaluation Request from Client " + str(
+            request['client_id']) + " for request: " + str(request['req_id']))
+        output("Request Message: " + str(request))
+        # assign a global id to the request
+
+        obj_type = 'resource'
+        this_obj = 'subject'
+
+        timestamp = time.time()
+
+        # Wait for writes arrived before the current read request to be completed to avoid starvation
+        # Below conditions should satisfy.
+        # Wait until pendingMightWrite list is empty i.e., all pending possibly conflicting request are complete.
+        attr_list = []
+        for attribute in defReadAttr(this_obj, request):
+            attr_list.append(attribute)
+        for attribute in mightReadAttr(this_obj, request):
+            attr_list.append(attribute)
+        output("Preventing Starvation of Write due to Read Request")
+        await(noPendingMightWriteAttr(attr_list, this_obj, timestamp, request) == True)
+        output("Exiting AWAIT.....!!!!")
+
+        request.update({'coord_id1': coordinator_id})
+        request.update({'global_request_id': global_request_id})
+
+        global_request_id = global_request_id + 1
+        # Get the current timestamp from function now()
+        timestamp = time.time()
+        # Piggyback timestamp on to the request
+        request.update({'timestamp': timestamp})
+
+        if request['might_update_obj'] == '':
+
+            # This is a read request
+            # Updating the read timestamp of definitely read attributes to current timestamp.
+            for attribute in defReadAttr(this_obj, request):
+                latestVersionBefore(list_version, this_obj, attribute, request['timestamp']).read_timestamp = request[
+                    'timestamp']
+                # Add might read attributes to the pendingMightRead list with request id and current timestamp.
+            for attribute in mightReadAttr(this_obj, request):
+                v = latestVersionBefore(list_version, this_obj, attribute, request['timestamp'])
+                if v and v.pendingMightRead:
+                    v.pendingMightRead.append(request['req_id'])
+        else:
+
+            request.update({'coord_id1': coordinator_id})
+            request.update({'global_request_id': global_request_id})
+
+            global_request_id = global_request_id + 1
+            # Get the current timestamp from function now()
+            timestamp = time.time()
+            # Piggyback timestamp on to the request
+            request.update({'timestamp': timestamp})
+
+            # this is a write request
+            if request['might_update_obj'] == 1:
+                obj_type = 'resource'
+                this_obj = 'subject'
+            else:
+                obj_type = 'subject'
+                this_obj = 'resource'
+            # Add definetely read and might read attributes to the pendingMightRead list with request id and current timestamp.
+            attr_list = []
+            for attribute in defReadAttr(this_obj, request):
+                attr_list.append(attribute)
+            for attribute in mightReadAttr(this_obj, request):
+                attr_list.append(attribute)
+
+            for attribute in attr_list:
+                v = latestVersionBefore(list_version, this_obj, attribute, request['timestamp'])
+                if v and v.pendingMightRead:
+                    v.pendingMightRead.append(request['req_id'])
+
+        # Piggyback cached updates on the request.
+        cache_updates = cachedUpdates(this_obj, request)
+        if this_obj == 'subject':
+            request.update({'sub_cache_updates': cache_updates[0]})
+        elif this_obj == 'resource':
+            request.update({'res_cache_updates': cache_updates[1]})
+
+        # This function is used for determining the second coordinator based on object type sent in request.
+        coord_id2 = determineCoordinator2(request, obj_type, no_of_coordinators)
+        request.update({'coord_id2': coord_id2})
+        output("Coord " + str(request['coord_id1']) + " is sending request " + str(
+            request['req_id']) + " from client " + str(request['client_id']) + " to coord " + str(request['coord_id2']))
+        send(('coord2_policy_eval', request), to=coordinator_dict[request['coord_id2']])
+
+    # invoked when coord1 sends the request for policy evaluation to coord 2
+    def receive(msg=('coord2_policy_eval', request), from_=Coordinator):
+        output("Coord " + str(coordinator_id) + " received Policy Evaluation Request from Coordinator " + str(
+            request['coord_id1']) + " for request: " + str(request['req_id']))
+        output("Request Message from Coordinator: " + str(request))
+        if request['might_update_obj'] == '':
+            # this is a read request
+            this_obj = 'resource'
+            # Updating the read timestamp of definitely read attributes to current timestamp.
+            for attribute in defReadAttr(this_obj, request):
+                latestVersionBefore(list_version, this_obj, attribute, request['timestamp']).read_timestamp = request[
+                    'timestamp']
+                # Add might read attributes to the pendingMightRead list with request id and current timestamp.
+            for attribute in mightReadAttr(this_obj, request):
+                v = latestVersionBefore(list_version, this_obj, attribute, request['timestamp'])
+                if v and v.pendingMightRead:
+                    v.pendingMightRead.append(request['req_id'])
+            # Wait for writes arrived before the current read request to be completed to avoid starvation
+            # Below conditions should satisfy.
+            # Wait until pendingMightWrite list is empty i.e., all pending possibly conflicting request are complete.
+            attr_list = []
+            for attribute in defReadAttr(this_obj, request):
+                attr_list.append(attribute)
+            for attribute in mightReadAttr(this_obj, request):
+                attr_list.append(attribute)
+        else:
+            # this is a write request
+            if request['might_update_obj'] == 1:
+                this_obj = 'subject'
+            else:
+                this_obj = 'resource'
+
+            # Add definetely read and might read attributes to the pendingMightRead list with request id and current timestamp.
+            attr_list = []
+            for attribute in defReadAttr(this_obj, request):
+                attr_list.append(attribute)
+            for attribute in mightReadAttr(this_obj, request):
+                attr_list.append(attribute)
+
+            for attribute in attr_list:
+                latestVersionBefore(list_version, this_obj, attribute, request['timestamp']).pendingMightRead.append(
+                    request['req_id'])
+
+        # Piggyback cached updates on the request.
+        cache_updates = cachedUpdates(this_obj, request)
+        if this_obj == 'subject':
+            request.update({'sub_cache_updates': cache_updates[0]})
+        elif this_obj == 'resource':
+            request.update({'res_cache_updates': cache_updates[1]})
+
+        w_id = determineWorker()
+        request.update({'w_id': w_id})
+
+        output("Assigned worker " + str(w_id) + " to request: " + str(request['req_id']))
+        send(('evaluate_policy', request), to=dedicated_workers_dict[request['w_id']])
+
+    def restart(request):
+        send(("restart", request), to=coordinator_dict[coordinator_id])
+
+    def get_db_tuple(request):
+        attr = request['updatedAttr']
+        tuple = ()
+        if (request['updatedObj'] == 'subject'):
+            if attr[0] == 'status':
+                tuple = (request['subject_id'], None, attr[1], None)
+            elif attr[0] == 'history':
+                tuple = (request['subject_id'], None, None, attr[1])
+        else:
+            if attr[0] == 'account_bal':
+                tuple = (request['resource_id'], attr[1], None, None)
+
+        return tuple
+
+    def receive(msg=('readAttr', request), from_=Coordinator):
+        # Update read timestamps.
+        for attribute in mightReadAttr(object, request):
+            v = latestVersionBefore(object, attribute, request['timestamp'])
+
+            # Remove request entry from pendingMightRead queue.
+            if request['req_id'] in v.pendingMightRead:
+                v.pendingMightRead.remove(request['req_id'])
+
+            # Update read timestamp of the version if the attribute is read during evaluation.
+            if attribute in request['readAttr' + request['updatedObj']]:
+                v.read_timestamp = request['timestamp']
+
+        for attribute in defReadAttr(object, request):
+            v = latestVersionBefore(object, attribute, request['timestamp'])
+
+            # Remove request entry from pendingMightRead queue.
+            if request['req_id'] in v.pendingMightRead:
+                v.pendingMightRead.remove(request['req_id'])
+
+            # Update read timestamp of the version if the attribute is read during evaluation.
+            if attribute in request['readAttr' + str(request['updatedObj'])]:
+                v.read_timestamp = request['timestamp']
+
+    # invoked when worker sends update request decision to coordinator 2
+    def receive(msg=('update-decision', request), from_=Worker):
+        output("Coordinator " + str(coordinator_id) + " received decision [Request: " + str(
+            request['req_id']) + " , Client: " + str(request['client_id']) + "] from Worker")
+        output("Request Message: " + str(request))
+
+        object = request['object']
+        if not request['updatedObj']:
+
+            output("Inside coordinator while returning from worker")
+
+            for attr in mightReadAttr(object, request):
+                v = latestVersionBefore(list_version, object, attr, request['timestamp'])
+
+                if v.pendingMightRead:
+                    if request['req_id'] in v.pendingMightRead:
+                        v.pendingMightRead.remove(request['req_id'])
+
+                    if attr in request['readAttr' + request['object']]:
+                        v.read_timestamp = request['timestamp']
+
+            output("Done with coordinator while returning from worker")
+        else:
+            for attr in request['updatedAttr']:
+                v = latestVersionBefore(list_version, object, attr, request['timestamp'])
+                if v:
+                    v.pendingMightWrite.append(request['req_id'])
+
+            output("Checking for conflict")
+            conflict = checkForConflicts(object, request)
+            output("Conflict  Before Await Check for request id: " + str(request['req_id']) + " from client id: " + str(
+                request['client_id']) + " -> " + str(conflict))
+
+            if not conflict:
+                # TODO: Put await condition
+                # await(forall attribute in request.updatedAttr:
+                # latestVersionBefore(object, attribute, request['timestamp'].pendingMightRead == [])
+                # or (len(latestVersionBefore(object, attribute, request['timestamp'].pendingMightRead) == 1
+                #     and  attribute in latestVersionBefore(object, attribute, request['timestamp']).pendingMightRead)))
+                attr_list = []
+                attr_list.append(request['updatedAttr'][0])
+                await(noPendingMightReadAttr(attr_list, request['updatedObj'], request['timestamp'], request) == True)
+
+                output("Checking Again for conflict")
+                conflict = checkForConflicts(object, request)
+                output(
+                    "Conflict Check After Await for request id: " + str(request['req_id']) + " from client id: " + str(
+                        request['client_id']) + " -> " + str(conflict))
+
+                if not conflict:
+                    send((('write', coordinator_id, request['updatedObj'], get_db_tuple(request))), to=database)
+
+                    performCacheUpdates(request)
+
+                    # check conflicts, update db, etc that needs to eb done for update requests
+                    update_latest_Version(list_version, request['object'], request['updatedAttr'], request['timestamp'],
+                                          request['timestamp'])
+
+                    for attribute in mightReadAttr(object, request):
+                        v = latestVersionBefore(list_version, object, attribute, request['timestamp'])
+
+                        if v and v.pendingMightRead:
+                            output("Removing Pending Might Read")
+                            # Remove request entry from pendingMightRead queue.
+                            if request['req_id'] in v.pendingMightRead:
+                                v.pendingMightRead.remove(request['req_id'])
+
+                            # Update read timestamp of the version if the attribute is read during evaluation.
+                            if attribute in request['readAttr' + request['updatedObj']]:
+                                v.read_timestamp = request['timestamp']
+
+                    for attribute in defReadAttr(object, request):
+                        v = latestVersionBefore(list_version, object, attribute, request['timestamp'])
+
+                        if v and v.pendingMightRead:
+                            output("Removing Pending def Read")
+                            # Remove request entry from pendingMightRead queue.
+                            if request['req_id'] in v.pendingMightRead:
+                                v.pendingMightRead.remove(request['req_id'])
+
+                            # Update read timestamp of the version if the attribute is read during evaluation.
+                            if attribute in request['readAttr' + str(request['updatedObj'])]:
+                                v.read_timestamp = request['timestamp']
+
+                    output("Removing data from Pending Might Write")
+                    # Remove request entry from pendingMightWrite queue.
+                    for attribute in request['updatedAttr']:
+                        v = latestVersionBefore(list_version, object, attribute, request['timestamp'])
+                        if v and v.pendingMightWrite and request['req_id'] in v.pendingMightWrite:
+                            v.pendingMightWrite.remove(request['req_id'])
+
+                    output("Sending update decision to client")
+                    # Send the decision to the client after update is successful.
+                    send(("update-decision", request), to=client_dict[request['client_id']])
+
+                    output("Sending Decision to readonly obj")
+                    # Notify coordinator of read-only object that request committed, so it can update read timestamps.
+                    send(("readAttr", request, request['readonlyObj']), to=coordinator_dict[request['coord_id2']])
+
+                else:
+                    restart(request)
+            else:
+                restart(request)
+
+    def receive(msg=('restart', request), from_=Coordinator):
+
+        output("Restarting the request id: " + str(request['req_id']) + " For client id: " + str(request['client_id']))
+
+        v = latestVersionBefore(list_version, request['object'], request['updatedAttr'], request['timestamp'])
+        if v and v.pendingMightRead and v.pendingMightWrite:
+            if request['req_id'] in v.pendingMightRead:
+                v.pendingMightRead.remove(request['req_id'])
+
+            if request['req_id'] in v.pendingMightWrite:
+                v.pendingMightWrite.remove(request['req_id'])
+
+        # Get the current timestamp from function now().
+        timestamp = time.time()
+
+        # Piggyback timestamp on to the request.
+        request['timestamp'] = timestamp
+
+        # Add definetely read and might read attributes to the pendingMightRead list with request id and current timestamp.
+        for attribute in mightReadAttr(request['object'], request):
+            v = latestVersionBefore(list_version, object, attribute, request['timestamp'])
+
+            # Remove request entry from pendingMightRead queue.
+            v.pendingMightRead.append(request['req_id'])
+
+        for attribute in defReadAttr(request['object'], request):
+            v = latestVersionBefore(list_version, object, attribute, request['timestamp'])
+
+            # Remove request entry from pendingMightRead queue.
+            v.pendingMightRead.append(request['req_id'])
+
+        # Piggyback and override cached updates on the request.
+        # Piggyback cached updates on the request.
+        cache_updates = cachedUpdates(request['object'], request)
+        if request['object'] == 'subject':
+            request.update({'sub_cache_updates': cache_updates[0]})
+        elif request['object'] == 'resource':
+            request.update({'res_cache_updates': cache_updates[1]})
+
+        send(("coord2_policy_eval", request), to=coordinator_dict[request['coord_id2']])
+
+    def checkForConflicts(object, request):
+        i = 0
+        for attr in request['updatedAttr']:
+            if i % 2 == 0:
+                v = latestVersionBefore(list_version, object, attr, request['timestamp'])
+                if v and int(v.read_timestamp) >= int(request['timestamp']):
+                    return True
+            i += 1
+        return False

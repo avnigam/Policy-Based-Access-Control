@@ -1,0 +1,103 @@
+
+-----------------------------------------------------------------------
+Testing Scenarios:
+-----------------------------------------------------------------------
+Separate configuration files are used for running each of the test cases.
+
+1. Test case 1
+a) Basic Read Request Flow
+b) In this scenario clients will send read, write or both request kind of request for evaluation.
+c) Config File used to run test case: basic-algo.properties, basic-algo-read.properties, basic-algo-write.properties
+d) Command:
+    1) python -m da configure_nodes/configure_nodes.da config/<Config File>
+    2) python -m da -n Main -f --logfilename logs/<Log File> -L info src/Master.da config/<Config File>
+e) Log file produced: basic-algo-read.log
+f) The test case will show in logs that the request proceeds normally and the evaluation is received by client for each request before next request is sent for evaluation.
+   All changes made in the db will be shown in the db dump done before killing database.
+
+2. Test case 2
+a) Show starvation and Restart of request due to Conflict Detection
+b) In this scenario both the clients will send sequence request which will first wait in order to prevent starvation and then will detect conflict and will restart.
+c) Config File used to run test case: basic-algo-starve-conflict.properties
+d) Command:
+    1) python -m da configure_nodes/configure_nodes.da config/basic-algo-starve-conflict.properties
+    2) python -m da -n Main -f --logfilename logs/basic-algo-starve-conflict.log -L info src/Master.da config/basic-algo-starve-conflict.properties
+e) Log file produced: basic-algo-starve-conflict.log
+f) The test case will show in logs that the request proceeds normally and the evaluation is received by client for each request before next request is sent for evaluation.
+   All changes made in the db will be shown in the db dump done before killing database.
+
+3. Test case 3
+a) Show the scenario of prediction of client being wrong
+b) In this scenario both clients will simultaneously send sequence of request and worker will show that the prediction is wrong and it will send the decision to non-local coordinator.
+c) File used to run test case: basic-algo-prediction.properties
+d) Command:
+    1) python -m da configure_nodes/configure_nodes.da config/basic-algo-prediction.properties
+    2) python -m da -n Main -f --logfilename logs/basic-algo-prediction.log -L info src/Master.da config/basic-algo-prediction.properties
+e) Log file produced: subject-conflict.log
+f) The test case will show in logs that subject conflict happens for a particular request once and then the request proceeds normally after the evaluation is restarted.
+   All changes made in the db will be shown in the db dump done before killing database.
+
+4. Test case 4
+a) Basic stress test for multiple reads and writes
+b) In this scenario multiple clients will simultaneously send sequence of request for evaluation.
+c) File used to run test case: stress-test-read.properties, stress-test-write.properties
+d) Command:
+    1) python -m da configure_nodes/configure_nodes.da config/<Config File>
+    2) python -m da -n Main -f --logfilename logs/<Log File> -L info src/Master.da config/<Config File>
+e) Log file produced: stress-test-read.log, stress-test-write.log
+f) The test case will show in logs that subject conflict happens for a particular request once and then the request proceeds normally after the evaluation is restarted.
+   All changes made in the db will be shown in the db dump done before killing database.
+
+--------------------------------------------------------------------------------------------------------
+SUMMARY OF PERFORMANCE EVALUATION [PHASE 4 VERSUS PHASE 2]:
+--------------------------------------------------------------------------------------------------------
+In each experiment:
+	phase 4 is running on multiple nodes, same machine
+	phase 2 is running on single node, same machine
+	number of requests = 1000
+	all requests are sent from a single client
+	In config file, we keep zero_latency = 1 which indicates dummy policy evaluation with 0 latency time
+
+(1) read-only request:
+----------------------
+i.e., request['action_id'] == 'read' in our implementation
+----------------------------------------------------------------------------------------------------------
+                |phase 2          							|phase 4
+----------------------------------------------------------------------------------------------------------
+				| mean 				|standard deviation		|mean 			 |standard deviation
+----------------------------------------------------------------------------------------------------------
+2 coordinator:	|0.01695			|0.00436				|0.03627		 |0.02088
+5 coordinator:	|0.01689			|0.00499				|0.02396		 |0.01024
+10 coordinator: |0.01904			|0.00670				|0.01701		 |0.00623
+----------------------------------------------------------------------------------------------------------
+
+
+(2) read-write request for which the client correctly predicts the written object
+---------------------------------------------------------------------------------
+i.e., request['action_id'] == 'update' in our implementation and client_prediction = False in configuration file
+---------------------------------------------------------------------------------------------------------------
+                |phase 2           							|phase 4
+----------------------------------------------------------------------------------------------------------
+				| mean 				|standard deviation		|mean 			 |standard deviation
+----------------------------------------------------------------------------------------------------------
+2 coordinator:	|0.01899			|0.00687				|0.02156		 |0.00908
+5 coordinator:	|0.01941			|0.00673				|0.02116		 |0.00813
+10 coordinator: |0.01947			|0.00695				|0.01623		 |0.00631
+----------------------------------------------------------------------------------------------------------
+
+
+(3) read-write request for which the client incorrectly predicts the written object
+-----------------------------------------------------------------------------------
+i.e., request['action_id'] == 'update' in our implementation and client_prediction = True in configuration file
+----------------------------------------------------------------------------------------------------------
+                |phase 4           							|phase 2
+----------------------------------------------------------------------------------------------------------
+				| mean 				|standard deviation		|mean 			 |standard deviation
+----------------------------------------------------------------------------------------------------------
+2 coordinator:	|0.01899			|0.00687				|0.01852		 |0.0071
+5 coordinator:	|0.01941			|0.00673				|0.01520		 |0.0054
+10 coordinator: |0.01947			|0.00695				|0.01613		 |0.00565
+
+Limitations:
+These results are for a single run of each of these cases and may vary in other runs.
+Ideal approach would be to do multiple runs and then take the average values of mean and standard deviation.
